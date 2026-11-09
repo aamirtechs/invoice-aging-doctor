@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>invoice-aging-doctor</title>
+<style>
+*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f6f8fb;color:#17233b}
+header{background:#0b1f3a;color:#fff;padding:28px 20px;border-bottom:4px solid #d4a72c}
+header .wrap, main{max-width:900px;margin:0 auto}
+header h1{margin:0 0 6px;font-size:28px} header p{margin:0;color:#cfd9e8}
+main{padding:22px 16px 40px}
+.card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(11,31,58,.08)}
+label{font-weight:600;display:block;margin:14px 0 6px}
+textarea{width:100%;min-height:170px;padding:10px;border:1px solid #c9d3e0;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+input[type=text],input[type=number],input[type=date],select{padding:8px 10px;border:1px solid #c9d3e0;border-radius:8px;max-width:100%}
+.row{display:flex;flex-wrap:wrap;gap:14px} .row>div{flex:1 1 180px}
+button{background:#0b1f3a;color:#fff;border:0;border-radius:8px;padding:10px 18px;cursor:pointer;font-size:15px}
+button.accent{background:#d4a72c;color:#17233b;font-weight:700}
+button.secondary{background:#e7edf5;color:#0b1f3a}
+.btns{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+pre{background:#0b1f3a;color:#eef3fa;border-radius:10px;padding:16px;overflow:auto;white-space:pre-wrap;min-height:120px;font-size:13px}
+footer{max-width:900px;margin:0 auto;padding:0 16px 30px;color:#5a6a82;font-size:14px}
+a{color:#0b1f3a}
+.note{color:#5a6a82;font-size:13px}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>invoice-aging-doctor</h1><p>Turn an invoice export JSON into an aging report: buckets by days past due, per-customer totals, grand totals, and overdue count and amount.</p></div></header>
+<main>
+<div class="card">
+<label for="file">Choose a file</label>
+<input type="file" id="file" >
+<label for="input">JSON invoice export input</label>
+<textarea id="input" placeholder="Paste input here, choose a file, or load the sample."></textarea>
+
+<div class="row">
+<div><label for="asof">Reference date (CLI --as-of, YYYY-MM-DD)</label><input type="date" id="asof"></div>
+<div><label for="customer">Customer filter (CLI --customer, substring, case-insensitive)</label><input type="text" id="customer" placeholder="Beta LLC"></div>
+<div><label for="bucket">Bucket filter (CLI --bucket)</label><select id="bucket"><option value="">All buckets</option><option>Current</option><option>1-30</option><option>31-60</option><option>61-90</option><option>90+</option></select></div>
+</div>
+<div class="row">
+<div><label for="threshold">Overdue threshold for --check (optional)</label><input type="text" id="threshold" placeholder="1000.00"></div>
+</div>
+<label><input type="checkbox" id="check"> Gate mode (CLI --check: fails when any invoice is over 90 days past due, or overdue exceeds the threshold)</label>
+<div class="btns">
+<button class="accent" id="run">Run</button>
+<button class="secondary" id="sample">Load sample</button>
+<button class="secondary" id="sample2">Load invalid sample</button>
+<button class="secondary" id="download">Download report</button>
+</div>
+<label for="output">Report</label>
+<pre id="output">Press Run to see the report.</pre>
+</div>
+</main>
+<footer>
+<p>Built by AamirTechs. <a href="https://aamirtechs.github.io/">All tools</a> | <a href="https://github.com/aamirtechs/invoice-aging-doctor">Source</a></p>
+<p>Privacy: this tool runs 100% in your browser, nothing is uploaded.</p>
+</footer>
+<script id="core">
+
+var BUCKETS=["Current","1-30","31-60","61-90","90+"];
+function pyRepr(v){
+  if(typeof v==="string") return "'"+v.replace(/\\/g,"\\\\").replace(/'/g,"\\'")+"'";
+  if(v===null) return "None"; if(typeof v==="boolean") return v?"True":"False";
+  if(Array.isArray(v)) return "[...]"; if(typeof v==="object") return "{...}";
+  return String(v);
+}
+function typeName(v){ if(v===null) return "NoneType"; if(Array.isArray(v)) return "list"; var t=typeof v; if(t==="object") return "dict"; if(t==="string") return "str"; if(t==="boolean") return "bool"; if(t==="number") return Number.isInteger(v)?"int":"float"; return t; }
+function parseISODate(value, fieldName, label){
+  if(typeof value!=="string") throw new Error(label+": "+fieldName+" must be an ISO date string, got "+pyRepr(value));
+  var m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  var ok=false, days=0;
+  if(m){ var y=+m[1], mo=+m[2], d=+m[3]; var leap=(y%4===0&&y%100!==0)||y%400===0; var dim=[31,leap?29:28,31,30,31,30,31,31,30,31,30,31]; if(mo>=1&&mo<=12&&d>=1&&d<=dim[mo-1]){ ok=true; days=Math.round(Date.UTC(y,mo-1,d)/86400000); } }
+  if(!ok) throw new Error(label+": "+fieldName+" is not a valid ISO date YYYY-MM-DD: "+pyRepr(value));
+  return days;
+}
+function decimalToCents(text){
+  var m=/^([+-]?)(\d+(?:\.\d*)?|\.\d+)(?:[eE]([+-]?\d+))?$/.exec(text);
+  if(!m) return null;
+  var neg = m[1]==="-";
+  var mant=m[2], exp = m[3]?parseInt(m[3],10):0;
+  var dot=mant.indexOf("."), intPart=dot<0?mant:mant.slice(0,dot), fracPart=dot<0?"":mant.slice(dot+1);
+  var digits=(intPart+fracPart).replace(/^0+(?=\d)/,"");
+  var shift = exp - fracPart.length + 2;
+  var cents;
+  var big=BigInt(digits===""?"0":digits);
+  if(shift>=0){ cents=big*(10n**BigInt(shift)); }
+  else { var div=10n**BigInt(-shift); var q=big/div, r=big%div; if(r*2n>=div) q+=1n; cents=q; }
+  if(neg) cents=-cents;
+  return Number(cents);
+}
+function parseMoney(value, fieldName, label){
+  if(typeof value==="boolean") throw new Error(label+": "+fieldName+" must be a number, got "+pyRepr(value));
+  var cents=null;
+  if(typeof value==="number"){ if(!isFinite(value)) throw new Error(label+": "+fieldName+" is not a valid amount: "+pyRepr(value)); cents=decimalToCents(String(value)); }
+  else if(typeof value==="string"){ var t=value.trim(); if(!t) throw new Error(label+": "+fieldName+" must not be empty"); cents=decimalToCents(t); if(cents===null) throw new Error(label+": "+fieldName+" is not a valid amount: "+pyRepr(value)); }
+  else throw new Error(label+": "+fieldName+" must be a number, got "+pyRepr(value));
+  if(cents===null) throw new Error(label+": "+fieldName+" is not a valid amount: "+pyRepr(value));
+  if(cents<0) throw new Error(label+": "+fieldName+" must not be negative: "+pyRepr(value));
+  return cents;
+}
+function moneyStr(cents){ var neg=cents<0; var a=Math.abs(cents); var s=Math.floor(a/100)+"."+String(a%100).padStart(2,"0"); return neg?"-"+s:s; }
+function bucketFor(days){ if(days<=0) return "Current"; if(days<=30) return "1-30"; if(days<=60) return "31-60"; if(days<=90) return "61-90"; return "90+"; }
+function normalizeInvoice(raw,index){
+  var label="invoice "+index;
+  if(typeof raw!=="object"||raw===null||Array.isArray(raw)) throw new Error(label+": each invoice must be an object, got "+typeName(raw));
+  var id = ("id" in raw && raw.id!==undefined) ? raw.id : (("invoice_id" in raw && raw.invoice_id!==undefined) ? raw.invoice_id : raw.invoiceId);
+  if(id===null||id===undefined||(typeof id==="string"&&!id.trim())) throw new Error(label+": missing required field 'id'");
+  label="invoice "+id;
+  var customer=raw.customer;
+  if(typeof customer!=="string"||!customer.trim()) throw new Error(label+": missing or empty required field 'customer'");
+  if(!("issue_date" in raw)) throw new Error(label+": missing required field 'issue_date'");
+  if(!("due_date" in raw)) throw new Error(label+": missing required field 'due_date'");
+  parseISODate(raw.issue_date,"issue_date",label);
+  var dueDays=parseISODate(raw.due_date,"due_date",label);
+  if(!("amount" in raw)) throw new Error(label+": missing required field 'amount'");
+  var amount=parseMoney(raw.amount,"amount",label);
+  var status=raw.status, statusNorm = typeof status==="string" ? status.trim().toLowerCase() : "";
+  if(status!==null&&status!==undefined&&typeof status!=="string") throw new Error(label+": status must be a string, got "+pyRepr(status));
+  var paid;
+  if("paid_amount" in raw && raw.paid_amount!==null&&raw.paid_amount!==undefined) paid=parseMoney(raw.paid_amount,"paid_amount",label);
+  else if(statusNorm==="paid"||statusNorm==="settled") paid=amount;
+  else paid=0;
+  if(paid>amount) throw new Error(label+": paid_amount "+moneyStr(paid)+" exceeds amount "+moneyStr(amount));
+  return {id:String(id), customer:customer.trim(), dueDays:dueDays, dueISO:raw.due_date, amount:amount, paid:paid, balance:amount-paid, status:statusNorm};
+}
+function loadInvoices(text){
+  var data;
+  try{ data=JSON.parse(text); } catch(e){ throw new Error("invalid JSON: "+e.message); }
+  var rawList;
+  if(data!==null&&typeof data==="object"&&!Array.isArray(data)){
+    if(!("invoices" in data)) throw new Error("JSON object must contain an 'invoices' list");
+    rawList=data.invoices;
+  } else if(Array.isArray(data)) rawList=data;
+  else throw new Error("JSON top level must be a list of invoices or an object with an 'invoices' list");
+  if(!Array.isArray(rawList)) throw new Error("'invoices' must be a list");
+  return rawList.map(function(raw,i){ return normalizeInvoice(raw,i); });
+}
+function emptyBuckets(){ var b={}; BUCKETS.forEach(function(n){ b[n]={count:0, amount:0}; }); return b; }
+function buildReport(invoices, refDays, refISO){
+  var buckets=emptyBuckets(), customers={}, paidCount=0, excludedCount=0;
+  invoices.forEach(function(inv){
+    if(["void","cancelled","canceled"].indexOf(inv.status)>=0){ excludedCount++; return; }
+    if(inv.balance<=0){ paidCount++; return; }
+    var days=refDays-inv.dueDays, bucket=bucketFor(days);
+    buckets[bucket].count++; buckets[bucket].amount+=inv.balance;
+    if(!customers[inv.customer]) customers[inv.customer]={buckets:emptyBuckets(), total_count:0, total_amount:0};
+    var e=customers[inv.customer]; e.buckets[bucket].count++; e.buckets[bucket].amount+=inv.balance; e.total_count++; e.total_amount+=inv.balance;
+  });
+  var overdueCount=0, overdueAmount=0, grand=0, open=0;
+  BUCKETS.forEach(function(n){ grand+=buckets[n].amount; open+=buckets[n].count; if(n!=="Current"){ overdueCount+=buckets[n].count; overdueAmount+=buckets[n].amount; } });
+  return {reference_date:refISO, total_invoices:invoices.length, open_count:open, paid_count:paidCount, excluded_count:excludedCount, buckets:buckets, customers:customers, overdue_count:overdueCount, overdue_amount:overdueAmount, grand_total:grand};
+}
+function formatText(rep){
+  function padR(s,n){ s=String(s); while(s.length<n) s+=" "; return s; }
+  function padL(s,n){ s=String(s); while(s.length<n) s=" "+s; return s; }
+  var lines=[];
+  lines.push("Aging report as of "+rep.reference_date); lines.push("");
+  lines.push(padR("Bucket",10)+" "+padL("Count",6)+" "+padL("Amount",12));
+  BUCKETS.forEach(function(n){ var e=rep.buckets[n]; lines.push(padR(n,10)+" "+padL(e.count,6)+" "+padL(moneyStr(e.amount),12)); });
+  lines.push(padR("Total",10)+" "+padL(rep.open_count,6)+" "+padL(moneyStr(rep.grand_total),12));
+  lines.push("");
+  lines.push("Overdue: "+rep.overdue_count+" invoice(s), "+moneyStr(rep.overdue_amount));
+  lines.push("Invoices: "+rep.total_invoices+" total, "+rep.open_count+" open, "+rep.paid_count+" paid, "+rep.excluded_count+" excluded");
+  var custNames=Object.keys(rep.customers).sort();
+  if(custNames.length){
+    lines.push(""); lines.push("Per-customer totals:");
+    lines.push(padR("Customer",20)+" "+padL("Count",6)+" "+padL("Amount",12));
+    custNames.forEach(function(c){ var e=rep.customers[c]; lines.push(padR(c,20)+" "+padL(e.total_count,6)+" "+padL(moneyStr(e.total_amount),12)); });
+  }
+  return lines.join("\n")+"\n";
+}
+function localToday(){ var n=new Date(); function p(x){return String(x).padStart(2,"0");} return n.getFullYear()+"-"+p(n.getMonth()+1)+"-"+p(n.getDate()); }
+window.runTool = function(inputText, options){
+  options=options||{};
+  try{
+    var asOf = options.asOf || localToday();
+    var refDays=parseISODate(asOf,"--as-of","reference date");
+    var threshold=null;
+    if(options.overdueThreshold) threshold=parseMoney(String(options.overdueThreshold),"--overdue-threshold","threshold");
+    var allInvoices=loadInvoices(String(inputText==null?"":inputText));
+    var invoices=allInvoices;
+    if(options.customer){ var needle=String(options.customer).trim().toLowerCase(); invoices=invoices.filter(function(inv){ return inv.customer.toLowerCase().indexOf(needle)>=0; }); }
+    var report=buildReport(invoices, refDays, asOf);
+    var bucket=options.bucket||null;
+    if(bucket){
+      var match=BUCKETS.filter(function(n){ return n.toLowerCase()===String(bucket).trim().toLowerCase(); })[0];
+      if(!match) return "error: invalid --bucket "+pyRepr(String(bucket))+", expected one of: "+BUCKETS.join(", ");
+      bucket=match;
+      var nb=emptyBuckets(); nb[bucket]=report.buckets[bucket];
+      var ncust={};
+      Object.keys(report.customers).forEach(function(c){ var e=report.customers[c]; if(e.buckets[bucket].count>0){ var ne={buckets:emptyBuckets(), total_count:e.buckets[bucket].count, total_amount:e.buckets[bucket].amount}; ne.buckets[bucket]=e.buckets[bucket]; ncust[c]=ne; } });
+      report.buckets=nb; report.customers=ncust;
+      report.open_count=nb[bucket].count; report.grand_total=nb[bucket].amount; report.total_invoices=report.open_count; report.paid_count=0; report.excluded_count=0;
+      if(bucket==="Current"){ report.overdue_count=0; report.overdue_amount=0; } else { report.overdue_count=report.open_count; report.overdue_amount=report.grand_total; }
+    }
+    var out=formatText(report);
+    if(options.check){
+      var full = bucket ? buildReport(invoices, refDays, asOf) : report;
+      var has90 = full.buckets["90+"].count>0;
+      var over = threshold!==null && full.overdue_amount>threshold;
+      if(has90||over){
+        var reasons=[];
+        if(has90) reasons.push(full.buckets["90+"].count+" invoice(s) over 90 days past due");
+        if(over) reasons.push("overdue total "+moneyStr(full.overdue_amount)+" exceeds threshold "+moneyStr(threshold));
+        out+="CHECK FAILED: "+reasons.join("; ")+"\n";
+      } else {
+        out+="CHECK PASSED: no invoice over 90 days past due"+(threshold===null?"":" and overdue total within threshold "+moneyStr(threshold))+"\n";
+      }
+    }
+    return out;
+  } catch(e){ return "error: "+e.message; }
+};
+
+</script>
+<script>
+var SAMPLE = `[{"amount":1000.0,"customer":"Acme Corp","due_date":"2026-11-05","id":"INV-001","issue_date":"2026-10-01"},{"amount":500.0,"customer":"Acme Corp","due_date":"2026-10-21","id":"INV-002","issue_date":"2026-09-01"},{"amount":750.0,"customer":"Beta LLC","due_date":"2026-09-06","id":"INV-003","issue_date":"2026-08-01","paid_amount":250.0},{"amount":2000.0,"customer":"Beta LLC","due_date":"2026-08-07","id":"INV-004","issue_date":"2026-07-01"},{"amount":300.0,"customer":"Gamma Inc","due_date":"2026-07-07","id":"INV-005","issue_date":"2026-05-01"},{"amount":400.0,"customer":"Gamma Inc","due_date":"2026-10-15","id":"INV-006","issue_date":"2026-09-15","status":"paid"},{"amount":250.0,"customer":"Acme Corp","due_date":"2026-12-05","id":"INV-007","issue_date":"2026-11-01"}]`;
+var SAMPLE_NAME = "sample.json";
+var pickedName = "";
+var inputEl = document.getElementById("input");
+var outputEl = document.getElementById("output");
+document.getElementById("file").addEventListener("change", function(ev){
+  var f = ev.target.files[0]; if(!f) return; pickedName = f.name;
+  var r = new FileReader(); r.onload = function(){ inputEl.value = r.result; }; r.readAsText(f);
+});
+function gatherOptions(){ return { asOf: document.getElementById("asof").value || undefined,
+  customer: document.getElementById("customer").value || undefined,
+  bucket: document.getElementById("bucket").value || undefined,
+  check: document.getElementById("check").checked,
+  overdueThreshold: document.getElementById("threshold").value || undefined }; }
+document.getElementById("run").addEventListener("click", function(){
+  try { outputEl.textContent = window.runTool(inputEl.value, gatherOptions()); }
+  catch(e){ outputEl.textContent = "Error: " + e.message; }
+});
+document.getElementById("sample").addEventListener("click", function(){
+  inputEl.value = SAMPLE; pickedName = SAMPLE_NAME;
+  document.getElementById("asof").value = "2026-11-05";
+});
+document.getElementById("download").addEventListener("click", function(){
+  var blob = new Blob([outputEl.textContent], {type:"text/plain"});
+  var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "report.txt"; a.click(); URL.revokeObjectURL(a.href);
+});
+document.getElementById("sample2").addEventListener("click", function(){ inputEl.value = INVALID_SAMPLE; pickedName = "invalid.json"; document.getElementById("asof").value = "2026-11-05"; });
+var INVALID_SAMPLE = `[{"amount":100.0,"customer":"Acme Corp","due_date":"not-a-date","id":"INV-100","issue_date":"2026-10-01"}]`;
+(function(){ var t=document.getElementById("asof"); if(!t.value){ var n=new Date(); function p(x){return String(x).padStart(2,"0");} t.value = n.getFullYear()+"-"+p(n.getMonth()+1)+"-"+p(n.getDate()); } })();
+</script>
+</body>
+</html>
